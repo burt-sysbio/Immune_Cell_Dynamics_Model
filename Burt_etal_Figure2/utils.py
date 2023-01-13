@@ -2,37 +2,16 @@
 """
 simulation class minimal models with repeated stimulation
 """
-import readout_module as readouts
 import models as model
-
 import numpy as np
-from scipy.integrate import odeint, solve_ivp
+import copy
+from scipy.interpolate import InterpolatedUnivariateSpline, interp1d
+from scipy.integrate import solve_ivp
+from scipy.constants import N_A
 import pandas as pd
 import seaborn as sns
 import matplotlib
-import matplotlib.pyplot as plt
-import copy
-import itertools
-import matplotlib.ticker as ticker
-from scipy.optimize import minimize_scalar
 from matplotlib.colors import LogNorm
-from scipy.stats import lognorm as log_pdf
-import warnings
-from scipy.constants import N_A
-
-def lognorm_params(mode, stddev):
-    """
-    Given the mode and std. dev. of the log-normal distribution, this function
-    returns the shape and scale parameters for scipy's parameterization of the
-    distribution.
-    """
-    p = np.poly1d([1, -1, 0, 0, -(stddev/mode)**2])
-    r = p.roots
-    sol = r[(r.imag == 0) & (r.real > 0)].real
-    shape = np.sqrt(np.log(sol))
-    scale = mode * sol
-    return shape, scale
-
 
 def change_param(simlist, pname, arr):
     assert len(arr) == len(simlist)
@@ -81,14 +60,10 @@ class Simulation:
         y0[-2] = 1. # this should matter only for the first cell population at t0, other naive cells are not initialized yet and timer is reset
         y0[-3] = 1 # carrying capacity!
         y0[-4] = self.parameters["il2_stimulation"]
-        # multiply y0 as often as there are stimulations
-        #y0_tile = np.tile(y0, len(self.start_times))
-        #y0_tile = np.tile(y0, 1) # the tile was only used the naive cells were restimulated, now I stimulate effector cells to produce IL2
 
         # add a global IL2 concentration at the end
         il2_global_init = 6e7
         y0[-1] = il2_global_init
-        #y0_tile = np.concatenate((y0_tile, [il2_global_init]))
         y0[0] = self.parameters["initial_cells"] # only initialize the first naive cell population
         return y0
     
@@ -146,10 +121,6 @@ class Simulation:
         needs parameters that indicate different starting times...
         return: should return same as run_model function
         """
-        if "max_step" in kwargs:
-            print("running model with step size " + str(kwargs["max_step"]))
-        else:
-            print("running model, no step size set")
         start_times = self.start_times
 
         y0 = self.init_model()
@@ -169,7 +140,7 @@ class Simulation:
             sol = solve_ivp(fun = model.repeated_stimulation,
                             t_span = (tstart, tend), y0 = y0,
                             args=(mode, d, vir_model), **kwargs,
-                            method = 'LSODA')
+                            method = "LSODA")
 
             # append all simulation data except for the last time step because this will be included in next simulation
             ts.append(sol.t[:-1])
@@ -180,47 +151,19 @@ class Simulation:
 
             ys.append(sol.y[:,:-1])
 
-
         state = np.hstack(ys).T
         time = np.hstack(ts).T
         self.time = time
 
-        #state = odesol.y
-        # # with new solve_ivp method, I need to transpose, because output is switched compared to ODEint
-        # state = state.T
-        #
         # # factor out global IL2 before splitting array and summing across all stimulations
         state[:,-1] = state[:,-1] * (1e12 / (20e-6*N_A))
-        #state = state[:,:-1]
-        #state = np.split(state, len(1), axis = 1) # exchange len(1) with len(start_times) for previous version
-        #state = np.sum(state, axis = 0)
-        #
         cell_arr = state[:,:-4]
         mol_arr = state[:,-4:] # contains timer and carry information
 
-        # # reset the IL2 from individual simulations (IL2 external, not used atm)
-        # # with global IL2, need to reshape IL2 array for proper concatenation
-        #mol_arr = np.hstack((mol_arr,il2[:,None]))
-        #
         self.cell_arr = cell_arr
         self.mol_arr = mol_arr
         return cell_arr, mol_arr
 
-    
-    def plot_cells(self, ylim = [1e-1, 1e7],  **kwargs):
-        #self.compute_cellstates()
-        g = sns.relplot(data = self.cells, x = "time", y = "value", kind = "line",
-                        col = "species", facet_kws= {"sharey" : True})
-        g.set(yscale = "log", ylim = ylim)
-        plt.show()
-        return g
-    
-
-    def plot_molecules(self, **kwargs):
-        #self.compute_cellstates()
-        g = sns.relplot(data = self.mols, x = "time", y = "value", kind = "line",
-                        col = "species", facet_kws= {"sharey" : False})
-        plt.show()
         return g
 
     def get_readouts(self):
@@ -230,10 +173,10 @@ class Simulation:
         state = self.cells
         state = state.loc[state["species"] == "eff",:]
 
-        peak = readouts.get_peak_height(state.time, state.value)
-        area = readouts.get_area(state.time, state.value)
-        tau = readouts.get_peaktime(state.time, state.value)
-        decay = readouts.get_duration(state.time, state.value)
+        peak = get_peak_height(state.time, state.value)
+        area = get_area(state.time, state.value)
+        tau = get_peaktime(state.time, state.value)
+        decay = get_duration(state.time, state.value)
         
         reads = [peak, area, tau, decay]
         read_names = ["Peak", "Area", "Peaktime", "Decay"]
@@ -337,184 +280,6 @@ class Simulation:
             
         return df
     
-    
-    def norm(self, val, pname, norm):
-        """
-        optimization function
-        calculate difference between simulated response size and wanted response size
-        val : parameter value
-        pname: str, parameter name
-        norm : wanted response size
-        returns float, difference in abs. values between wanted resp. size and calc. response size
-        """
-        self.parameters[pname] = float(val)
-        state = self.state
-        area = readouts.get_area(state.time, state.cells)
-
-        return np.abs(area-norm)
-
-    
-    def norm_readout(self, pname, norm, bounds = None):
-        """
-        adjust parameter to given normalization condition (area = norm)
-        pname: str of parameter name to normalize
-        norm : value of area to normalize against
-        bounds : does not work well - if bounds provided, only scan for paramter in given range
-        returns: adjusted parameter value
-        """
-        if bounds != None:
-            method = "Bounded"
-        else:
-            method = "Brent"
-        
-        # minimize norm function for provided values
-        out = minimize_scalar(self.norm, method = method, bounds=bounds, args=(pname, norm, ))  
-        #if pname == "beta_p":
-        #    print(out)
-        #    print(self.mode)
-        
-        dummy = np.nan
-        print(out.success, out.fun, out.x)
-        # check results of optimization object
-        if out.success == True and out.fun < 1e-2:
-            dummy = out.x
-            
-        return dummy
-
-
-    def get_heatmap(self, arr1, arr2, name1, name2, norm_list = None):
-        
-        """
-        make a heatmap provide two arrays and two parameter names as well
-        as readout type by providing readout function
-        can also provide normalization value for log2 presentation
-        """
-        area_grid = []
-        peaktime_grid = []
-        peak_grid = []
-        grids = [area_grid, peaktime_grid, peak_grid]
-        readout_funs = [readouts.get_area, readouts.get_peaktime, readouts.get_peak_height]
-        old_params = dict(self.parameters)
-
-        assert (len(readout_funs) == len(grids))
-        # if no normalization was provided do not normalize so use None for each readout
-        if norm_list is None:
-            norm_list = [None for _ in readout_funs]
-
-        for val1, val2 in itertools.product(arr1, arr2):
-            # loop over each parameter combination and get readouts
-            self.parameters[name1] = val1
-            self.parameters[name2] = val2
-            self.compute_cellstates()
-            df = self.cells.loc[self.cells["species"] == "CD4_all"]
-            # get each readout and normalize, append to grid
-            for readout_fun, grid, norm_val in zip(readout_funs, grids, norm_list):
-                readout = readout_fun(df.time, df.value)
-                if norm_val is not None:
-                    readout = np.log2(readout/norm_val)
-                grid.append(readout)
-
-            self.parameters = dict(old_params)
-            #print(len(z))
-
-        # process output, combine readouts
-        df = pd.DataFrame(grids)
-        df = df.T
-        df.columns = ["Area", "Peak Time", "Peak Height"]
-
-        mylist = [(x, y) for x, y in itertools.product(arr1, arr2)]
-        df[["param_val1", "param_val2"]] = mylist
-        df=df.melt(id_vars=["param_val1", "param_val2"], var_name = "readout")
-        df["name"] = self.name
-        df["pname1"] = name1
-        df["pname2"] = name2
-        return df
- 
-    
-    def plot_heatmap(self, arr1, arr2, name1, name2, readout_fun, norm = None, 
-                     vmin = None, vmax = None, title = None, 
-                     label1 = None, label2 = None, cmap = "bwr", log = True,
-                     cbar_label = "change response size"):
-    
-        arr1, arr2, val = self.get_heatmap(arr1, arr2, name1, name2, readout_fun, norm)
-
-        fig, ax = plt.subplots(figsize = (6,4))
-        color = cmap
-        cmap = ax.pcolormesh(arr1, arr2, val, cmap = color, vmin = vmin, vmax = vmax,
-                             rasterized = True)
-
-        
-        loc_major = ticker.LogLocator(base = 10.0, numticks = 100)
-        loc_minor = ticker.LogLocator(base = 10.0, 
-                                      subs = np.arange(0.1,1,0.1),
-                                      numticks = 12) 
-        
-        if log == True:
-            ax.set_xscale("log")
-            ax.set_yscale("log")
-            ax.xaxis.set_major_locator(loc_major)
-            ax.xaxis.set_minor_locator(loc_minor)
-        ax.set_xlabel(label1)
-        ax.set_ylabel(label2)
-        ax.set_title(title)
-        cbar = plt.colorbar(cmap)
-        cbar.set_label(cbar_label)
-            
-        plt.tight_layout()
-        # previously returned fig
-
-        return fig
-    
-    def gen_lognorm_params(self, pname, std, n = 20):
-        """
-        deprecated use set_params_lognorm
-        """
-        mean = self.parameters[pname]
-        sigma, scale = lognorm_params(mean, std)
-        sample = log_pdf.rvs(sigma, 0, scale, size = n)
-        
-        return sample
-    
-
-    def get_lognorm_array(self, pname, res, CV = 0.1):
-        """
-        generate lognorm array with given CV
-        res: number of parameter values sampled from lognorm
-        mean of lognorm taken from current value of simulation object pname
-
-        """
-        # need to check if tuple was provided, if yes then parameters need to be the same for this analysis!
-
-        myval = self.parameters[pname]
-        assert myval != 0
-        std = myval * CV
-        sigma, scale = lognorm_params(myval, std)
-        sample = log_pdf.rvs(sigma, 0, scale, size=res)
-        return sample
-
-    def set_params_lognorm(self, params : list, CV = 0.1):
-        """
-        take a list of params and shuffle lognorm style
-        """
-        for pname in params:
-            assert pname in self.parameters.keys()
-            sample = self.get_lognorm_array(pname, 1, CV)
-            self.parameters[pname] = sample[0]
-
-
-    def draw_new_params(self, param_names, heterogeneity):
-        """
-        deprecated use set_params_lognorm
-        """
-        for param in param_names:
-            mean = self.parameters[param] 
-            std = mean*(heterogeneity/100.)
-            print("watch out, dividing by 100 for some ancient mistaken? reason...")
-            sigma, scale = lognorm_params(mean, std)
-            sample = log_pdf.rvs(sigma, 0, scale, size = 1)
-            # I only want single float, not array
-            sample = sample[0]
-            self.parameters[param] = sample
 
     def reset_params(self):
         """
@@ -550,24 +315,13 @@ class SimList:
        
     def __init__(self, sim_list):
         self.sim_list = sim_list
- 
     
-    def reduce_list(self, cond):
-        sim_list_red = [sim for sim in self.sim_list if np.abs(sim.get_area()-cond) < 1.]
-        return SimList(sim_list_red)
-    
-    
-    def get_readout(self, name):
-        readout_list = []
-        for sim in self.sim_list:
-            df = sim.get_readouts()
-            # check that readout name is actually available since I change readouts sometimes
-            assert name in df.readout.values
-            out = float(df.read_val[df.readout == name])
-            readout_list.append(out)
-        return readout_list
+    def run_timecourses(self):
+        df_list = [sim.get_cells(["CD4_all"]) for sim in self.sim_list]
+        df = pd.concat(df_list)
 
-         
+        return df
+    
     def pscan(self, pnames, arr = None, scales = (1,1), n = None, normtype = "first", use_percent = False, **kwargs):
         pscan_list = []
         for sim in self.sim_list:
@@ -583,40 +337,15 @@ class SimList:
         df = pd.concat(pscan_list)
         return df
     
-    
-    def run_timecourses(self):
-        df_list = [sim.get_cells(["CD4_all"]) for sim in self.sim_list]
-        df = pd.concat(df_list)
-
-        return df
-    
-    
-    def normalize(self, pname, norm, bounds):
-        out_list = []
-        for sim in self.sim_list:
-            out = sim.norm_readout(pname, norm, bounds = bounds)
-            out_list.append(out)
-        return out_list
-
-
-    def get_param_arr(self, pname):
-        out = [sim.parameters[pname] for sim in self.sim_list]
-        return out
-
-    
     def plot_timecourses(self, arr, arr_name, log = True, log_scale = False, xlim = (None, None),
-                         ylim = (None, None), cmap = "cividis_r", cbar_scale = 1.,
-                         il2_max = False, ticks = None, data = None, norm_arr = None):
+                         ylim = (None, None), cmap = "cividis_r",
+                         data = None, norm_arr = None):
         """
         plot multple timecourses with colorbar
         can provide a data argument from run timecourses
         """
-        # parameter for scaling of color palette in sns plot
-        # run the time courses to generate data
-
-        #cmap =  # sns.color_palette("light:grey_r", as_cmap=True)
         if data is None:
-            print("hi there")
+            print("running time courses, please wait")
             data = self.run_timecourses()
             data = data.reset_index(drop = True)
             if norm_arr is not None:
@@ -652,40 +381,189 @@ class SimList:
         ax.set_ylabel("cell dens. norm.")
         g.set_titles("{col_name}")
         
-        # if ticks are true take the upper lower and middle part as ticks
-        # for colorbar
-        if ticks == True:
-            if log == True:
-                ticks = np.geomspace(np.min(arr), np.max(arr), 3)
-            else:
-                ticks = np.linspace(np.min(arr), np.max(arr), 3)
-
-            cbar = g.fig.colorbar(sm, ax = g.axes, ticks = ticks)
-            cbar.ax.set_yticklabels(np.round(cbar_scale*ticks,2))
-        else:
-            cbar = g.fig.colorbar(sm, ax = g.axes, ticks = ticks)
-        # add colorbar
-        
-        cbar.set_label(arr_name)
-        #print(100*arr)
-
-        
-        cbar.ax.yaxis.set_minor_formatter(ticker.NullFormatter())
-        
+        cbar = g.fig.colorbar(sm, ax = g.axes)
+        cbar.set_label(arr_name)  
+    
         if log_scale == True:
             g.set(yscale = "log", ylim = (0.1, None))    
         
 
         return g, data
+
+
+### helper functions to calculate readouts
+
+def get_maximum(x, y):
+    """
+    interpolate maximum
+    """
+    f = InterpolatedUnivariateSpline(x, y, k=4)
+    cr_pts = f.derivative().roots()
+    cr_pts = np.append(cr_pts, (x[0], x[-1])) 
+    cr_vals = f(cr_pts)
+    max_index = np.argmax(cr_vals)
+
+    max_x = cr_pts[max_index]
+    max_y = cr_vals[max_index]
+
+    return max_x, max_y
+
+
+def get_tau(time, cells):
+    """
+    get halftime of peak
+    """
+    cells = cells.array 
+    crit = check_criteria(cells)
     
+    if crit == True:
     
-    def plot_pscan(self, pnames):
-        data = self.pscan(pnames)
-        g = sns.relplot(data = data, x = "xnorm", hue = "model_name", y = "log2FC", col = "readout",
-                    row = "pname", kind = "line")
-        g.set(xscale = "log")
+        peak_idx = np.argmax(cells)
+        # get max value
+        peak = cells[peak_idx]
+        peak_half = peak / 2.
+        cells = cells[:(peak_idx+1)]
+        time = time[:(peak_idx+1)]
+        # assert that peak is not at beginning
+        if peak_idx <= 3:
+            tau = np.nan
+        # assert that peak half is in new cell array
+        elif np.all(peak_half<cells):
+            tau = np.nan
+        else:
+            f = interp1d(cells, time)           
+            tau = f(peak_half)
+            tau = float(tau)
+            
+    else:
+        tau = np.nan
+            
+    return tau    
+
+
+
+def get_peak_height(time, cells):
+    """
+    get height of peak
+    """
+    cells = cells.array
+    time = time.array
+    crit = check_criteria(cells)
+
+    if crit == True:
+        peaktime, peak_val = get_maximum(time, cells)
+    else: 
+        peak_val = np.nan
         
-        return g
+    return peak_val
 
 
 
+def get_peaktime(time, cells):
+    """
+    get time of peak
+    """
+    cells = cells.array
+    time = time.array
+    crit = check_criteria(cells)
+    
+    if crit == True:
+        peaktime, peak_val = get_maximum(time, cells)
+    else:
+        peaktime = np.nan
+    
+    return peaktime
+
+
+
+def get_duration(time, cells):
+    """
+    get total time when cells reach given threshold
+    """
+    cells = cells.array
+    time = time.array
+    crit = check_criteria(cells)
+    thres = 0.001
+    if crit == True and (cells > thres).any():
+        # get times where cells are > value
+        time2 = time[cells > thres]
+        #use last element 
+        dur = time2[-1]
+
+    else:
+        dur = np.nan
+        
+    return dur
+        
+
+def get_decay(time, cells):
+    """
+    get the half-time of decay
+    """
+    
+    cells = cells.array 
+    crit = check_criteria(cells)
+    cellmax = np.amax(cells)
+    cellmin = cells[-1] 
+    
+    if crit == True:
+        peak_id = np.argmax(cells)
+        cells = cells[peak_id:]
+        time = time[peak_id:]
+        
+        # make sure there are at least two values in the array
+        assert len(cells) > 1
+        
+        # interpolate to get time unter half of diff between max and arr end is reached
+        celldiff = (cellmax - cellmin) / 2
+        celldiff = cellmax - celldiff
+        f = interp1d(cells, time)
+        #print(cellmax, cellmin, celldiff)
+        tau = f(celldiff)
+    else:
+        tau = np.nan
+    
+    return float(tau)
+
+
+def get_area(time, cells):
+    
+    cells = cells.array 
+    crit = check_criteria(cells)
+    
+    if crit == True:
+        area = np.trapz(cells, time)
+    else: 
+        area = np.nan
+        
+    return area
+
+
+def check_criteria(cells): 
+    cellmax = np.amax(cells)
+    cellmin = cells[-1]
+    last_cells = cells[-10]
+    # test first if peak id is at the end of array
+    peak_id = np.argmax(cells)
+    if peak_id >= len(cells) - 12:
+        return False
+    
+    # check if cells increase and decrease around peak monotonically
+    arr_inc = np.diff(cells[(peak_id-10):peak_id]) > 0
+    arr_dec = np.diff(cells[peak_id:(peak_id+10)]) < 0
+    crit4 = arr_inc.all() and arr_dec.all()
+
+    # check difference between max and endpoint
+    crit1 = np.abs(cellmax-cellmin) > 1e-3
+    # check that max is higher than endpoint
+    crit2 = cellmax > cellmin
+    # check that something happens at all
+    crit3 = np.std(cells) > 0.001
+    # check that last cells are close to 0
+    crit5 = (last_cells < 1e-1).all()
+    crit5 = np.std(last_cells) < 1e-1
+
+    criteria = [crit1, crit2, crit3, crit4, crit5]
+    crit = True if all(criteria) else False
+
+    return crit
